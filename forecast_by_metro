@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jun  7 22:28:45 2021
+
+@author: wilhelmleinemann
+"""
+
+#metro level us forecasts
+import pandas as pd
+import numpy as np
+import sklearn
+import seaborn as sns
+import datetime as dt
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from sklearn import preprocessing
+from fbprophet import Prophet
+from sklearn.metrics import mean_squared_error
+import logging
+logging.getLogger('prophet').setLevel(logging.ERROR)
+import warnings
+warnings.filterwarnings("ignore")
+from fbprophet.diagnostics import performance_metrics
+from fbprophet.diagnostics import cross_validation
+
+import snowflake.connector
+from snowflake.connector import DictCursor
+import json
+
+with open("snowflake_credentials.txt") as file:
+    cred = json.load(file)
+    
+db_con = snowflake.connector.connect(**cred)
+cur = db_con.cursor(DictCursor)
+
+def sqlExec(query):
+    df = pd.DataFrame(cur.execute(query).fetchall())
+    df.columns = map(str.lower, df.columns)
+    return df
+
+def ikea_map(category_name):
+    if (category_name == 'IKEA Delivery') or (category_name == 'IKEA Assembly') or (category_name == 'IKEA GM Assembly'):
+        return "IKEA"
+    else:
+        return category_name
+        
+
+def add_covid_impact(df):
+    df = pd.merge(left=df,
+         right=df_covid,
+         on='ds',
+         how='left')
+    return df
+
+
+def gb_helper(df):
+    df = df.groupby(by='ds',as_index=False).sum()
+    df = add_covid_impact(df)
+    return df
+
+supply_sql = """
+
+with recos as
+(
+select tr.metro_id
+  ,    m.name as metro_name
+--  ,    tr.category_id
+--  ,    c.name as category_name
+  ,    TRUNC(tr.local_created_at,'day') reco_day
+  ,    COUNT(DISTINCT tr.recommendation_id)as num_recos
+from "TASKRABBIT_PRODUCTION"."PUBLIC"."JOB_RECOMMENDATIONS" tr
+join public.categories c
+on tr.category_id = c.id
+join (select g.metro_id
+        ,    g.name
+        ,    g.time_zone
+      from public.geographies g
+      where g.id = g.metro_id) m
+on tr.metro_id = m.metro_id
+where tr.local_created_at >= '2017-12-01'
+and tr.last_in_funnel
+and tr.locale = 'en-US'
+group by tr.metro_id
+  ,    m.name
+--  ,    tr.category_id
+--  ,    c.name
+  ,    TRUNC(tr.local_created_at,'day')
+order by metro_name
+  ,      reco_day
+  ,      num_recos DESC
+)
+,
+jobs_select as 
+(
+select j.metro_id
+  ,    m.name as metro_name
+--  ,    j.category_id
+--  ,    c.name as category_name
+  ,    TRUNC(j.opened_state_at,'day') reco_day
+  ,    COUNT(DISTINCT j.id) as num_jobs
+from jobs as j
+join public.categories c
+on j.category_id = c.id
+join (select g.metro_id
+        ,    g.name
+        ,    g.time_zone
+      from public.geographies g
+      where g.id = g.metro_id) m
+on j.metro_id = m.metro_id
+where j.opened_state_at >= '2017-12-01'
+and j.v2_id is NULL
+and j.booking_attempt = 1
+and j.fixup_key is NULL
+and (j.suppress_level < 1000 or j.suppress_level is NULL)
+and j.locale = 'en-US'
+group by j.metro_id
+  ,    m.name
+--  ,    j.category_id
+--  ,    c.name
+  ,    TRUNC(j.opened_state_at,'day')
+order by metro_name
+  ,      reco_day
+  ,      num_jobs DESC
+)
+,
+invoices as
+(
+select j.metro_id as metro_id
+  ,    m.name as metro_name
+--  ,    j.category_id
+--  ,    c.name as category_name
+  ,    TRUNC(ji.submitted_state_at,'day') reco_day
+  ,    COUNT(DISTINCT ji.id) as num_invoices
+  ,    SUM(ji.poster_subtotal_cents) as gmv
+from public.job_invoices ji
+join public.jobs j
+on ji.job_id = j.id
+join public.categories c
+on j.category_id = c.id
+join (select g.metro_id
+        ,    g.name
+        ,    g.time_zone
+      from public.geographies g
+      where g.id = g.metro_id) m
+on j.metro_id = m.metro_id
+where ji.submitted_state_at >= '2017-12-01'
+and j.v2_id is NULL
+and j.booking_attempt = 1
+and j.fixup_key is NULL
+and (j.suppress_level < 1000 or j.suppress_level is NULL)
+and j.locale = 'en-US'
+group by j.metro_id
+  ,    m.name
+--  ,    j.category_id
+--  ,    c.name
+  ,    TRUNC(ji.submitted_state_at,'day')
+order by metro_name
+  ,      reco_day
+  ,      num_invoices DESC
+)
+,
+taskers as 
+(
+select distinct count(rca.rabbit_id) as num_taskers
+  ,    rca.date as reco_day
+  ,    rp.geo_json_metro_id as metro_id
+from RABBIT_CALENDAR_AVAILABILITIES rca
+join rabbit_profiles rp
+on rca.rabbit_id = rp.user_id
+where rca.date >= '2017-12-01'
+--and rca.date <= '2021-05-01'
+--and rp.geo_json_metro_id in (1063,1078)
+group by rca.date
+  ,  rp.geo_json_metro_id
+)
+
+
+select recos.metro_id
+  ,    recos.metro_name
+--  ,    recos.category_id
+--  ,    recos.category_name
+  ,    recos.reco_day
+  ,    recos.num_recos
+  ,    jobs_select.num_jobs
+  ,    invoices.num_invoices
+  ,    invoices.gmv
+  ,    taskers.num_taskers
+from recos
+left join jobs_select
+on (recos.metro_id = jobs_select.metro_id) and (recos.metro_name = jobs_select.metro_name) and (recos.reco_day = jobs_select.reco_day)-- and (recos.category_id = jobs_select.category_id) and (recos.category_name = jobs_select.category_name)
+left join invoices
+on (recos.metro_id = invoices.metro_id) and (recos.metro_name = invoices.metro_name) and (recos.reco_day = invoices.reco_day)-- and (recos.category_id = invoices.category_id) and (recos.category_name = invoices.category_name)
+left join taskers
+on (recos.metro_id = taskers.metro_id) and (recos.reco_day = taskers.reco_day)
+
+"""
+
+df = sqlExec(supply_sql)
+
+df_merge = (df.groupby(by=['metro_name','reco_day'],as_index=False).sum().drop(columns=['metro_id']))
+df_m = df.groupby(by='metro_name',as_index=False).sum()
+df_m = df_m.query('num_invoices > 99').metro_name
+
+df_merge = pd.merge(left=df_merge,
+                    right=df_m,
+                    on='metro_name',
+                    how='inner')
+
+df_covid = pd.read_csv('covid_impact.csv')
+df_covid = df_covid.rename(columns={'Name':'ds','United States':'covid_impact'})
+df_covid.ds = pd.to_datetime(df_covid.ds)
+df_covid = df_covid.filter(items=['ds','covid_impact'])
+
+
+def simple_model_helper(df,regressor_name):
+    m = Prophet()
+    m.add_regressor('covid_impact')
+    m.add_country_holidays(country_name='US')
+    m.add_seasonality(name='monthly',period=30.5, fourier_order=5)
+    m.fit(df)
+    future_df = m.make_future_dataframe(periods=365)
+    future_df = add_covid_impact(future_df)
+    forecast_df = m.predict(future_df).filter(items=['ds','yhat'])
+    forecast_df['yhat'] = np.clip(forecast_df['yhat'],0,100000)
+    forecast_df = forecast_df.rename(columns={'yhat':regressor_name})
+    return forecast_df
+
+
+#main loop
+target = 'num_jobs'
+df_all = df_merge.rename(columns={'reco_day':'ds',target:'y'})
+total_preds = pd.DataFrame()
+
+#met_list = ['London']
+#for met in df_merge.metro_name.unique()
+#met = 'London'
+for met in df_merge.metro_name.unique():
+    idx_met = ((df_all['metro_name']==met))
+    df_met = df_all[idx_met]
+    df_else = df_all[~idx_met]
+    
+    df_met = gb_helper(df_met)
+    df_else = gb_helper(df_else)
+    
+#    df_met_f = simple_model_helper(df_met, 'met')
+    df_else_f = simple_model_helper(df_else, 'others')
+    
+    df_met = (pd.merge(left=df_met,
+                       right=df_else_f,
+                       on=['ds']))
+    
+    m = Prophet()
+    m.add_regressor('covid_impact')
+    m.add_regressor('others')
+    m.add_country_holidays(country_name='US')
+    m.add_seasonality(name='monthly', period=30.5, fourier_order=5)
+    m.fit(df_met)
+    pred = m.predict(df_met)
+    m.plot(pred)
+    m.plot_components(pred)
+    
+    df_met_f = m.make_future_dataframe(periods=365)
+    df_met_f = add_covid_impact(df_met_f)
+    df_met_f = df_met_f.merge(right=df_else_f,on='ds')
+    df_forecast = m.predict(df_met_f)
+    df_forecast['yhat'] = np.clip(df_forecast['yhat'],0,100000)
+    df_forecast['metro_name'] = met
+    df_forecast = df_forecast.filter(items=['metro_name','ds','yhat'])
+    df_forecast = pd.merge(left = df_met,
+                   right = df_forecast,
+                   on = 'ds',
+                   how = 'right')
+    total_preds = pd.concat([total_preds,df_forecast],ignore_index=True)
+    print(met)
+
+total_preds = total_preds.rename(columns={'y':target,'yhat':'pred_'+target})
+
+
+total_preds.to_csv('us_job_forecasts_060721.csv',index=False)
+
+
